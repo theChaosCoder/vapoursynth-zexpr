@@ -202,6 +202,15 @@ static inline ujit::Mem legalise_mem(zj_ctx* ctx, zj_mem_t m, uint32_t access_by
             ctx->cc.add(addr, base, index, aj::a64::lsl(m.shift));
         }
         if (m.disp != 0) {
+            // Fold the displacement into the load/store immediate when it fits (ldur imm9 or
+            // scaled uimm12) instead of spending an extra `add` per access.
+            const uint32_t isz = m.size != 0u ? uint32_t(m.size) : access_bytes;
+            const bool ifits_unscaled = (m.disp >= -256 && m.disp <= 255);
+            const bool ifits_scaled = (isz > 0u) && (m.disp >= 0) && ((uint32_t(m.disp) % isz) == 0u) &&
+                                      ((uint32_t(m.disp) / isz) <= 4095u);
+            if (ifits_unscaled || ifits_scaled) {
+                return aj::a64::ptr(addr, m.disp);
+            }
             ctx->uc.emit_3i(ujit::UniOpRRR::kAdd, addr, addr, aj::Imm(m.disp));
         }
         return aj::a64::ptr(addr);
