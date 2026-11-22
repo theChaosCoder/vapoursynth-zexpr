@@ -12,6 +12,7 @@
 //! ~2.5x higher throughput than scalar lookups (~16.8 GB/s single-core on AVX2).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../expr/ast.zig");
 const analysis_mod = @import("../expr/analysis.zig");
 const interp = @import("../expr/interp.zig");
@@ -289,7 +290,53 @@ pub const Lut = struct {
 /// schedule the gathers like cranexpr's Rust loop instead of serializing loads behind stores.
 fn lutRowU16(comptime DstT: type, noalias d: [*]DstT, noalias s: [*]const u16, noalias t: [*]const DstT, n: usize) void {
     var x: usize = 0;
-    if (DstT == u16) {
+    if (DstT == u16 and builtin.cpu.arch == .aarch64) {
+        // 8 px/iteration in fixed AArch64: one `ldnp` = 8 indices, `ubfx` extraction, 8 table `ldrh`,
+        // balanced `orr` packing, one `stp` (9 loads + 1 store instead of 16 + 8). Written in asm so
+        // LLVM cannot split the wide loads back up. The non-temporal source load keeps the src stream
+        // from evicting the 128 KB table out of L1 (Apple M4: 1880 -> 2180 fps; `stnp` for dst was slower).
+        const blocks = n / 8;
+        if (blocks > 0) {
+            var dp = d;
+            var sp = s;
+            var cnt = blocks;
+            asm volatile (
+                \\1:
+                \\ldnp x8, x9, [%[sp]]
+                \\add %[sp], %[sp], #16
+                \\ubfx x10, x8, #16, #16
+                \\ubfx x11, x8, #32, #16
+                \\lsr x12, x8, #48
+                \\and x8, x8, #0xffff
+                \\ubfx x13, x9, #16, #16
+                \\ubfx x14, x9, #32, #16
+                \\lsr x15, x9, #48
+                \\and x9, x9, #0xffff
+                \\ldrh w8, [%[t], x8, lsl #1]
+                \\ldrh w10, [%[t], x10, lsl #1]
+                \\ldrh w11, [%[t], x11, lsl #1]
+                \\ldrh w12, [%[t], x12, lsl #1]
+                \\ldrh w9, [%[t], x9, lsl #1]
+                \\ldrh w13, [%[t], x13, lsl #1]
+                \\ldrh w14, [%[t], x14, lsl #1]
+                \\ldrh w15, [%[t], x15, lsl #1]
+                \\orr x8, x8, x10, lsl #16
+                \\orr x11, x11, x12, lsl #16
+                \\orr x8, x8, x11, lsl #32
+                \\orr x9, x9, x13, lsl #16
+                \\orr x14, x14, x15, lsl #16
+                \\orr x9, x9, x14, lsl #32
+                \\stp x8, x9, [%[dp]], #16
+                \\subs %[cnt], %[cnt], #1
+                \\b.ne 1b
+                : [dp] "+r" (dp),
+                  [sp] "+r" (sp),
+                  [cnt] "+r" (cnt),
+                : [t] "r" (t),
+                : .{ .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .nzcv = true, .memory = true });
+            x = blocks * 8;
+        }
+    } else if (DstT == u16) {
         // SWAR: one 64-bit load yields 4 indices, one 64-bit store writes 4 results
         // (5 loads + 1 store per 4 px instead of 8 loads + 4 stores).
         while (x + 4 <= n) : (x += 4) {
