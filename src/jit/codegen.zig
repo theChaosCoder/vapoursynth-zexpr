@@ -47,7 +47,9 @@ const XMode = union(enum) {
     /// Branchless interior vector loop (all relative horizontal accesses are in bounds).
     interior,
     /// Fallback runtime loop for huge `|dx|` where unrolling > 8 edge vectors would bloat code.
-    dynamic_rel,
+    /// `[lo, hi)` is the strip's column range, so accesses that stay in bounds for every lane of
+    /// the strip (e.g. `x[65,0]` on the left edge) can use plain loads instead of gathers.
+    dynamic_rel: struct { lo: usize, hi: usize },
 };
 
 const Invariance = enum(u8) {
@@ -675,7 +677,7 @@ pub fn compilePlane(
 
                 const left_loop = b.newLabel();
                 b.bind(left_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .dynamic_rel);
+                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_rel = .{ .lo = 0, .hi = left_end } });
                 if (env.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
@@ -796,7 +798,7 @@ pub fn compilePlane(
 
                 const right_loop = b.newLabel();
                 b.bind(right_loop);
-                try emitDagBody(allocator, &b, prog, info, spec, env, .dynamic_rel);
+                try emitDagBody(allocator, &b, prog, info, spec, env, .{ .dynamic_rel = .{ .lo = right_start, .hi = spec.width } });
                 if (env.v_x) |vx| {
                     if (prog.opt_int) {
                         b.vecOp3(.add_i32, vx, vx, v_lane_step_i32.?);
@@ -965,10 +967,16 @@ fn emitRelLoad(
                 b.vecPermuteF32(dst, dst, perm[0..lanes]);
             }
         },
-        .dynamic_rel => {
-            // Runtime clamped/mirrored gather within `row_ptr` for huge `|dx|` offsets.
-            if (eff_dx == 0) {
-                const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, 0);
+        .dynamic_rel => |strip| {
+            // Runtime clamped/mirrored gather within `row_ptr` for huge `|dx|` offsets, unless
+            // every lane of every iteration of this strip stays inside `[0, width)`.
+            const lanes: usize = b.cpu.f32_lanes;
+            const iters: usize = (strip.hi - strip.lo + lanes - 1) / lanes;
+            const first: i64 = @as(i64, @intCast(strip.lo + col_disp)) + eff_dx;
+            const last: i64 = @as(i64, @intCast(strip.lo + col_disp + iters * lanes - 1)) + eff_dx;
+            if (eff_dx == 0 or (iters > 0 and first >= 0 and last < w_i32)) {
+                const disp: i32 = (eff_dx + @as(i32, @intCast(col_disp))) * @as(i32, @intCast(bps));
+                const mem = aj.Mem.indexed(row_ptr, env.x_gp, shift, disp);
                 if (out_ty == .i32) {
                     pixel.emitLoadI32(b, dst, mem, fmt);
                 } else {
