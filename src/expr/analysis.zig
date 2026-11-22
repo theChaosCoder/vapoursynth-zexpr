@@ -2,6 +2,7 @@
 //! LUT eligibility, `opt=1` value typing (Y15), use counts, and `i16` range analysis (Y1).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const interp = @import("interp.zig");
 
@@ -328,7 +329,9 @@ pub fn analyze(
                     // 128 KB 1D u16 LUT hits L2 (~1k fps 1T at 1080p); AVX2 f32 SIMD beats it for
                     // prefilter masks, sqrt, div, and short polynomials (cost < 24), while
                     // transcendentals (sin/cos/exp/log/pow, cost >= 24) still win via LUT.
-                    const u16_lut_min_cost: u32 = 24;
+                    // NEON is 4-wide f32, so the scalar LUT already wins from cost ~16 on Apple M4
+                    // (exp: 720 -> 1310 fps 1T at 1080p YUV420P16); AVX2 keeps the x86-tuned 24.
+                    const u16_lut_min_cost: u32 = if (builtin.cpu.arch.isAARCH64()) 16 else 24;
                     if (cost >= u16_lut_min_cost) {
                         res.lut_clips[0] = c0;
                         res.lut_kind = .lut1d_u16;
