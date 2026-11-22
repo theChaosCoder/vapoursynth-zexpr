@@ -263,9 +263,7 @@ pub const Lut = struct {
                 for (0..height) |y| {
                     const d_row: [*]DstT = @ptrCast(@alignCast(offsetRowMut(dst_base, dst_stride, y)));
                     const s_row: [*]const u16 = @ptrCast(@alignCast(offsetRow(s0_base, s0_stride, y)));
-                    for (0..width) |x| {
-                        d_row[x] = lut_vals[s_row[x]];
-                    }
+                    lutRowU16(DstT, d_row, s_row, lut_vals, width);
                 }
             },
             .lut2d_u8 => {
@@ -286,6 +284,31 @@ pub const Lut = struct {
         }
     }
 };
+
+/// One row of a 1D u16 LUT. `noalias` (dst, src and table never overlap) lets LLVM unroll and
+/// schedule the gathers like cranexpr's Rust loop instead of serializing loads behind stores.
+fn lutRowU16(comptime DstT: type, noalias d: [*]DstT, noalias s: [*]const u16, noalias t: [*]const DstT, n: usize) void {
+    var x: usize = 0;
+    if (DstT == u16) {
+        // SWAR: one 64-bit load yields 4 indices, one 64-bit store writes 4 results
+        // (5 loads + 1 store per 4 px instead of 8 loads + 4 stores).
+        while (x + 4 <= n) : (x += 4) {
+            const w: u64 = @bitCast(s[x..][0..4].*);
+            const r: u64 = @as(u64, t[@as(u16, @truncate(w))]) |
+                (@as(u64, t[@as(u16, @truncate(w >> 16))]) << 16) |
+                (@as(u64, t[@as(u16, @truncate(w >> 32))]) << 32) |
+                (@as(u64, t[@as(u16, @truncate(w >> 48))]) << 48);
+            d[x..][0..4].* = @bitCast(r);
+        }
+    } else {
+        while (x + 4 <= n) : (x += 4) {
+            var v: [4]DstT = undefined;
+            inline for (0..4) |k| v[k] = t[s[x + k]];
+            inline for (0..4) |k| d[x + k] = v[k];
+        }
+    }
+    while (x < n) : (x += 1) d[x] = t[s[x]];
+}
 
 /// Compile a specialized AsmJit plane kernel for 1D `u8 -> u8` LUTs using
 /// AVX-512 VBMI `vpermb`, AVX2/SSE4.1 `vpshufb + vpblendvb` tree, or AArch64 NEON `tbl`.
