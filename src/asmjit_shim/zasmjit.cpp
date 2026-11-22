@@ -1661,7 +1661,34 @@ void zj_vec_permute_f32(zj_ctx* ctx, zj_reg_t dst, zj_reg_t src, const uint32_t*
 #endif
 }
 
+#if defined(ASMJIT_UJIT_AARCH64)
+// Register-only 4-lane NEON gather: `umov` each 32-bit offset, `add` the base, and `ld1` straight into
+// the destination lane. Replaces the stack round-trip (vector store, 4x scalar load/load/store, vector
+// reload) and its store-to-load forwarding stalls. u8/u16 lanes land in the low bytes of zeroed i32 lanes.
+static void emit_neon_reg_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg, zj_reg_t offsets_reg, uint32_t elem_bytes) noexcept {
+    const ujit::Vec off = unpack_vec(offsets_reg);
+    const ujit::Gp base = unpack_gp(base_reg);
+    ujit::Vec acc = ctx->uc.new_vec128();  // fresh register: `dst` may alias `offsets_reg`
+    ctx->cc.movi(acc.b16(), 0);
+    for (uint32_t i = 0; i < 4u; ++i) {
+        ujit::Gp o = ctx->uc.new_gp64();
+        ujit::Gp addr = ctx->uc.new_gp64();
+        ctx->cc.umov(o.w(), off.s(i));  // writing Wn zero-extends into Xn (callers clamp offsets >= 0)
+        ctx->cc.add(addr, base, o);
+        const ujit::Vec lane = elem_bytes == 4u ? acc.s(i) : elem_bytes == 2u ? acc.h(i * 2u) : acc.b(i * 4u);
+        ctx->cc.ld1(lane, aj::a64::ptr(addr));
+    }
+    ctx->cc.mov(unpack_vec(dst).b16(), acc.b16());
+}
+#endif
+
 static void emit_scalar_gather_impl(zj_ctx* ctx, zj_reg_t dst, zj_reg_t base_reg, zj_reg_t offsets_reg, uint32_t elem_bytes) noexcept {
+#if defined(ASMJIT_UJIT_AARCH64)
+    if (ctx->cpu.f32_lanes == 4u) {
+        emit_neon_reg_gather_impl(ctx, dst, base_reg, offsets_reg, elem_bytes);
+        return;
+    }
+#endif
     const uint32_t lanes = ctx->cpu.f32_lanes;
     const uint32_t vec_bytes = ctx->cpu.vec_bytes;
     ujit::Mem off_slot = ctx->cc.new_stack(vec_bytes, vec_bytes);
