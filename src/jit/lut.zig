@@ -447,6 +447,10 @@ fn lutRowU16ToU16(
     noalias lut_vals: [*]const u16,
     width: usize,
 ) void {
+    if (builtin.cpu.arch == .aarch64) {
+        lutRowU16ToU16A64(d_row, s_row, lut_vals, width);
+        return;
+    }
     var sp: [*]align(2) const u64 = @ptrCast(s_row);
     var dp: [*]align(2) u64 = @ptrCast(d_row);
     var chunks = width >> 3;
@@ -457,6 +461,62 @@ fn lutRowU16ToU16(
         dp[0] = lookupPack4U16(lut_vals, p0);
         dp[1] = lookupPack4U16(lut_vals, p1);
         dp += 2;
+    }
+    var x = width & ~@as(usize, 7);
+    while (x < width) : (x += 1) {
+        d_row[x] = lut_vals[s_row[x]];
+    }
+}
+
+/// AArch64 version of `lutRowU16ToU16`: the same `ldp`/8x `ldrh`/`orr`/`stp` shape in fixed asm
+/// (LLVM is free to split the u64 loads back into per-lane `ldrh`), but with a non-temporal `ldnp`
+/// source load so the src stream does not evict the 128 KB table (= the whole M4 L1D) out of L1.
+/// Apple M4, 1080p YUV420P16, 1 thread: ~1880 -> ~2180 fps; `stnp` for dst was slower.
+fn lutRowU16ToU16A64(
+    noalias d_row: [*]u16,
+    noalias s_row: [*]const u16,
+    noalias lut_vals: [*]const u16,
+    width: usize,
+) void {
+    const blocks = width >> 3;
+    if (blocks != 0) {
+        var dp = d_row;
+        var sp = s_row;
+        var cnt = blocks;
+        asm volatile (
+            \\1:
+            \\ldnp x8, x9, [%[sp]]
+            \\add %[sp], %[sp], #16
+            \\ubfx x10, x8, #16, #16
+            \\ubfx x11, x8, #32, #16
+            \\lsr x12, x8, #48
+            \\and x8, x8, #0xffff
+            \\ubfx x13, x9, #16, #16
+            \\ubfx x14, x9, #32, #16
+            \\lsr x15, x9, #48
+            \\and x9, x9, #0xffff
+            \\ldrh w8, [%[t], x8, lsl #1]
+            \\ldrh w10, [%[t], x10, lsl #1]
+            \\ldrh w11, [%[t], x11, lsl #1]
+            \\ldrh w12, [%[t], x12, lsl #1]
+            \\ldrh w9, [%[t], x9, lsl #1]
+            \\ldrh w13, [%[t], x13, lsl #1]
+            \\ldrh w14, [%[t], x14, lsl #1]
+            \\ldrh w15, [%[t], x15, lsl #1]
+            \\orr x8, x8, x10, lsl #16
+            \\orr x11, x11, x12, lsl #16
+            \\orr x8, x8, x11, lsl #32
+            \\orr x9, x9, x13, lsl #16
+            \\orr x14, x14, x15, lsl #16
+            \\orr x9, x9, x14, lsl #32
+            \\stp x8, x9, [%[dp]], #16
+            \\subs %[cnt], %[cnt], #1
+            \\b.ne 1b
+            : [dp] "+r" (dp),
+              [sp] "+r" (sp),
+              [cnt] "+r" (cnt),
+            : [t] "r" (lut_vals),
+            : .{ .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .nzcv = true, .memory = true });
     }
     var x = width & ~@as(usize, 7);
     while (x < width) : (x += 1) {
